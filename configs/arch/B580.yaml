@@ -1,0 +1,24 @@
+name: "B580"
+# Intel Arc B580 (Xe2 / Battlemage) - 20 Xe-cores, 160 EUs
+# Source: kernel-skills/skills/intel-xe-hardware-reference/resources/xe2.py
+
+freq_GHz: 2.4                     # Fmax 2400 MHz
+
+# Memory subsystem
+SRAM_capacity: 18874368            # 18 MB L2 cache
+SRAM_byte_per_cycle: 1280          # L2 read BW: 64 B/clk × 20 cores = 1280 B/cycle (3.072 TB/s)
+DRAM_capacity: 12884901888         # 12 GB GDDR6
+DRAM_byte_per_cycle: 190           # 456 GB/s ÷ 2.4 GHz = 190 B/cycle
+
+# Compute throughput (in MACs/cycle, 1 MAC = 2 OPs)
+# VE (Vector Engine / SIMD) - equivalent to CUDA cores
+MAC_per_cycle_fp32_sm: 2560        # VE FP32: 256 ops/clk × 20 cores ÷ 2 = 2560 MACs/clk (12.29 TFLOPS)
+MAC_per_cycle_fp32_tc: 2560        # Alias for compatibility (Xe2 has no separate fp32 matrix engine)
+
+# XMX (Xe Matrix eXtensions) - equivalent to Tensor Cores
+MAC_per_cycle_fp16_tc: 20480       # XMX FP16: 2048 ops/clk × 20 cores ÷ 2 = 20480 MACs/clk (98.30 TOPS)
+MAC_per_cycle_bf16_tc: 20480       # XMX BF16: same throughput as FP16 on Xe2
+MAC_per_cycle_int8_tc: 40960       # XMX INT8: 4096 ops/clk × 20 cores ÷ 2 = 40960 MACs/clk (196.61 TOPS)
+
+# Note: Xe2 does NOT support TF32, FP8, or FP4 (these require Xe3+)
+# B580 vs B60: Same compute, same DRAM BW. Differences: 12GB VRAM (vs 24GB), 18MB L2 (vs 4MB)

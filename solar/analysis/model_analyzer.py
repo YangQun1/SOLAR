@@ -656,7 +656,20 @@ class ModelAnalyzer:
         # Get architecture parameters
         freq_ghz = arch_config.get("freq_GHz", 1.0)
         mac_key = f"MAC_per_cycle_{precision}_tc"
-        mac_per_cycle = arch_config.get(mac_key, arch_config.get("MAC_per_cycle_fp32_tc", 1000))
+        mac_per_cycle = arch_config.get(mac_key)
+
+        # Fallback chain: precision-specific TC -> similar precision -> FP32
+        if mac_per_cycle is None:
+            if precision in ["bf16", "bfloat16"]:
+                mac_per_cycle = arch_config.get("MAC_per_cycle_fp16_tc")
+            elif precision in ["fp16", "float16", "half"]:
+                mac_per_cycle = arch_config.get("MAC_per_cycle_bf16_tc")
+            if mac_per_cycle is None:
+                mac_per_cycle = arch_config.get(
+                    "MAC_per_cycle_fp32_tc",
+                    arch_config.get("MAC_per_cycle_fp32_sm", 1000)
+                )
+
         dram_bw = arch_config.get("DRAM_byte_per_cycle", 1000)
         
         # Calculate memory bytes

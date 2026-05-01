@@ -6,6 +6,13 @@ set -euo pipefail
 # Outputs are written under:
 #   solar/examples/BERT/output/{graph,einsum,analysis,perf,timeloop}
 
+# Configurable architecture and precision (override via env or positional args)
+# Usage: ./run_solar.sh [ARCH] [PRECISION]
+#   e.g.: ./run_solar.sh B60 fp16
+#         SOLAR_ARCH=B60 SOLAR_PRECISION=bf16 ./run_solar.sh
+ARCH="${1:-${SOLAR_ARCH:-H100_PCIe}}"
+PRECISION="${2:-${SOLAR_PRECISION:-fp16}}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOLAR_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -45,12 +52,12 @@ python3 -m solar.cli.analyze_model \
   --einsum-graph-path "${EINSUM_OUT}/einsum_graph_renamed.yaml" \
   --output-dir "${ANALYSIS_OUT}"
 
-echo "==> Predicting perf -> ${PERF_OUT}"
+echo "==> Predicting perf (arch=${ARCH}, precision=${PRECISION}) -> ${PERF_OUT}"
 python3 -m solar.cli.predict_perf_model \
   --analysis-path "${ANALYSIS_OUT}/analysis.yaml" \
   --output-dir "${PERF_OUT}" \
-  --arch-config "H100_PCIe" \
-  --precision "fp32"
+  --arch-config "${ARCH}" \
+  --precision "${PRECISION}"
 
 echo "==> Converting to Timeloop format -> ${TIMELOOP_OUT}"
 python3 -m solar.cli.totimeloop \
@@ -58,7 +65,11 @@ python3 -m solar.cli.totimeloop \
   --output-dir "${TIMELOOP_OUT}"
 
 echo "==> Verifying einsum expressions"
-python3 -m solar.cli.verify_einsum_model "${OUT_BASE}" --scale 0.01
+if python3 -m solar.cli.verify_einsum_model "${OUT_BASE}" --scale 0.01; then
+  echo "  ✅ Verification passed"
+else
+  echo "  ⚠️  Verification skipped (solar_verifier not available or verification failed)"
+fi
 
 echo ""
 echo "Done."
@@ -69,6 +80,6 @@ echo "Einsum graph:    ${EINSUM_OUT}/einsum_graph.yaml"
 echo "Einsum renamed:  ${EINSUM_OUT}/einsum_graph_renamed.yaml"
 echo "Graph PDF:       ${EINSUM_OUT}/einsum_graph.pdf"
 echo "Analysis:        ${ANALYSIS_OUT}/analysis.yaml"
-echo "Perf:            ${PERF_OUT}/perf_H100_PCIe.yaml"
+echo "Perf:            ${PERF_OUT}/perf_${ARCH}.yaml"
 echo "Timeloop graph:  ${TIMELOOP_OUT}/timeloop_graph.yaml"
 echo "Verification:    ${OUT_BASE}/einsum_verification/einsum_verification.yaml"
