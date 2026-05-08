@@ -368,3 +368,45 @@ class TestElementwiseOnlyEndToEnd:
 
     def test_unfused_elements_positive(self, analysis):
         assert analysis["total"]["unfused_elements"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Test: Raw torch.einsum MACs (regression for op_type=einsum fallback)
+# ---------------------------------------------------------------------------
+class TestRawEinsumMacsEndToEnd:
+    """End-to-end: torch.einsum('qhd,khd->qhk') should include reduction dim K."""
+
+    MODEL_SOURCE = """\
+    import torch
+    import torch.nn as nn
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, q, k):
+            return torch.einsum("qhd,khd->qhk", q, k)
+
+    def get_inputs():
+        return [torch.randn(6, 32, 128), torch.randn(6, 32, 128)]
+
+    def get_init_inputs():
+        return []
+    """
+
+    @pytest.fixture
+    def analysis(self, tmp_path):
+        return _run_full_pipeline(tmp_path, self.MODEL_SOURCE)
+
+    def test_total_macs(self, analysis):
+        expected_macs = 6 * 6 * 32 * 128
+        assert analysis["total"]["macs"] == expected_macs
+
+    def test_einsum_layer_macs(self, analysis):
+        expected_macs = 6 * 6 * 32 * 128
+        einsum_layers = [
+            layer for layer in analysis["layers"].values()
+            if layer.get("type") == "einsum" and layer.get("einsum_equation") == "QHD,KHD->QHK"
+        ]
+        assert einsum_layers, "Expected a torch.einsum layer with equation QHD,KHD->QHK"
+        assert einsum_layers[0]["macs"] == expected_macs

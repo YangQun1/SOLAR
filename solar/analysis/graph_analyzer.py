@@ -49,7 +49,7 @@ import yaml
 from solar.einsum import EinsumAnalyzer
 from solar.common.constants import BYTES_PER_ELEMENT, DEFAULT_PRECISION
 from solar.common.types import TensorShapes
-from solar.common.utils import ensure_directory, NoAliasDumper
+from solar.common.utils import ensure_directory, NoAliasDumper, parse_einsum_equation
 
 
 PathLike = Union[str, Path]
@@ -60,6 +60,53 @@ def _product(shape: List[int]) -> int:
     for d in shape:
         out *= int(d)
     return int(out)
+
+
+def _compute_einsum_macs_from_equation(equation: str, ts: TensorShapes) -> Optional[int]:
+    """Compute MACs for a real einsum node from equation + concrete shapes.
+
+    Returns None when equation/shapes are missing or inconsistent so callers can
+    fall back to the existing analyzer path.
+    """
+    if not equation or "->" not in equation:
+        return None
+
+    input_operands, output_tokens = parse_einsum_equation(equation)
+    if not input_operands:
+        return None
+
+    rank_sizes: Dict[str, int] = {}
+
+    # Resolve rank sizes from input operands.
+    for operand_idx, tokens in enumerate(input_operands):
+        if operand_idx >= ts.num_inputs:
+            return None
+        shape = ts.inputs[operand_idx]
+        if len(tokens) != len(shape):
+            return None
+        for token, dim in zip(tokens, shape):
+            dim_int = int(dim)
+            prev = rank_sizes.get(token)
+            if prev is not None and prev != dim_int:
+                return None
+            rank_sizes[token] = dim_int
+
+    # Optionally validate/complete ranks from output operand.
+    if output_tokens and ts.num_outputs > 0:
+        out_shape = ts.outputs[0]
+        if len(output_tokens) != len(out_shape):
+            return None
+        for token, dim in zip(output_tokens, out_shape):
+            dim_int = int(dim)
+            prev = rank_sizes.get(token)
+            if prev is not None and prev != dim_int:
+                return None
+            rank_sizes[token] = dim_int
+
+    total_ops = 1
+    for dim in rank_sizes.values():
+        total_ops *= dim
+    return int(total_ops)
 
 
 class EinsumGraphAnalyzer:
@@ -245,10 +292,23 @@ class EinsumGraphAnalyzer:
             )
 
             ops_cost = 0
-            try:
-                ops_cost = int(self.einsum_analyzer.get_compute_cost(op_type, ts))
-            except Exception:
-                ops_cost = 0
+            if op_type == "einsum":
+                # For raw torch.einsum nodes, compute MACs from the actual
+                # equation and tensor ranks (e.g. QHD,KHD->QHK) instead of
+                # generic fallback op costs.
+                eq_ops = _compute_einsum_macs_from_equation(equation, ts)
+                if eq_ops is not None:
+                    ops_cost = int(eq_ops)
+                else:
+                    try:
+                        ops_cost = int(self.einsum_analyzer.get_compute_cost(op_type, ts))
+                    except Exception:
+                        ops_cost = 0
+            else:
+                try:
+                    ops_cost = int(self.einsum_analyzer.get_compute_cost(op_type, ts))
+                except Exception:
+                    ops_cost = 0
 
             # Zero-compute operations: no ALU work, only pointer/metadata
             # manipulation or pure memory copies.
