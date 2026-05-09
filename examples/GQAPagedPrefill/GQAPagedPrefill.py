@@ -100,10 +100,9 @@ class Model(nn.Module):
 
         gqa_ratio = num_qo_heads // num_kv_heads
 
-        q_f32 = q.to(torch.float32)
         # Flatten page dimension since page_size=1
-        k_cache_f32 = k_cache.squeeze(1).to(torch.float32)
-        v_cache_f32 = v_cache.squeeze(1).to(torch.float32)
+        k_cache_flat = k_cache.squeeze(1)
+        v_cache_flat = v_cache.squeeze(1)
 
         for b in range(len_indptr - 1):
             q_start = int(qo_indptr[b].item())
@@ -118,12 +117,12 @@ class Model(nn.Module):
             page_ids = kv_indices[kv_start:kv_end].to(torch.long)
 
             # Number of KV tokens is equal to number of pages for page_size=1
-            k_batch = k_cache_f32[page_ids]
-            v_batch = v_cache_f32[page_ids]
+            k_batch = k_cache_flat[page_ids]
+            v_batch = v_cache_flat[page_ids]
             num_kv_tokens = k_batch.shape[0]
 
             # Get queries for this sequence
-            q_batch = q_f32[q_start:q_end]
+            q_batch = q[q_start:q_end]
             num_q_tokens = q_batch.shape[0]
 
             delta = num_kv_tokens - num_q_tokens
@@ -144,14 +143,14 @@ class Model(nn.Module):
                     k_head = k_batch[:max_kv_idx, kv_head]
                     v_head = v_batch[:max_kv_idx, kv_head]
 
-                    logits = torch.matmul(q_head, k_head.T)
+                    logits = torch.matmul(q_head, k_head.T).to(torch.float32)
                     logits_scaled = logits * sm_scale
 
                     lse[global_q_idx, h] = torch.logsumexp(logits_scaled, dim=-1) / math.log(2.0)
 
                     attn = torch.softmax(logits_scaled, dim=-1)
-                    out_head = torch.matmul(attn, v_head)
-                    output[global_q_idx, h] = out_head.to(torch.bfloat16)
+                    out_head = torch.matmul(attn.to(torch.bfloat16), v_head)
+                    output[global_q_idx, h] = out_head
 
         return output, lse
 
@@ -224,6 +223,13 @@ if __name__ == "__main__":
     num_kv_heads = k_cache.shape[2]
     mac_terms = 0
 
+    unique_pages = torch.unique(kv_indices).numel()
+    kv_cache_touched_elems = unique_pages * page_size * num_kv_heads * head_dim
+    total_bytes = (
+        + (kv_cache_touched_elems * 2) * k_cache.element_size()  # k_cache + v_cache
+        + (qo_indptr.numel() + kv_indptr.numel() + kv_indices.numel()) * qo_indptr.element_size()
+    )
+
     for b in range(qo_indptr.shape[0] - 1):
         q_start = int(qo_indptr[b].item())
         q_end = int(qo_indptr[b + 1].item())
@@ -233,6 +239,9 @@ if __name__ == "__main__":
 
         if q_start >= q_end or kv_start >= kv_end:
             continue
+
+        total_bytes += (q_end - q_start) * num_qo_heads * head_dim * q.element_size() * 2  # q + o
+        total_bytes += (q_end - q_start) * lse.element_size()  # lse
 
         num_q_tokens = q_end - q_start
         num_kv_tokens = kv_end - kv_start  # page_size=1, one token per index
@@ -246,15 +255,4 @@ if __name__ == "__main__":
 
     total_macs = mac_terms * num_qo_heads * head_dim * 2
     print(f"total MACs: {total_macs}")
-
-    unique_pages = torch.unique(kv_indices).numel()
-    kv_cache_touched_elems = unique_pages * page_size * num_kv_heads * head_dim
-
-    total_bytes = (
-        q.numel() * q.element_size()
-        + (kv_cache_touched_elems * 2) * k_cache.element_size()  # k_cache + v_cache
-        + (qo_indptr.numel() + kv_indptr.numel() + kv_indices.numel()) * qo_indptr.element_size()
-        + output.numel() * output.element_size()
-        + lse.numel() * lse.element_size()
-    )
     print(f"total bytes: {total_bytes}")

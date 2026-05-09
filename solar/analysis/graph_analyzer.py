@@ -109,6 +109,44 @@ def _compute_einsum_macs_from_equation(equation: str, ts: TensorShapes) -> Optio
     return int(total_ops)
 
 
+def _dtype_bytes(dtype: Any, default_bytes: float) -> float:
+    """Map torch dtype string to bytes-per-element with safe fallback."""
+    if dtype is None:
+        return float(default_bytes)
+
+    key = str(dtype).strip().lower()
+    if key.startswith("torch."):
+        key = key[6:]
+
+    dtype_map = {
+        "bool": 1.0,
+        "uint8": 1.0,
+        "int8": 1.0,
+        "float8_e4m3fn": 1.0,
+        "float8_e5m2": 1.0,
+        "float8_e4m3fnuz": 1.0,
+        "float8_e5m2fnuz": 1.0,
+        "fp8": 1.0,
+        "int16": 2.0,
+        "short": 2.0,
+        "float16": 2.0,
+        "half": 2.0,
+        "bfloat16": 2.0,
+        "bf16": 2.0,
+        "int32": 4.0,
+        "int": 4.0,
+        "float32": 4.0,
+        "float": 4.0,
+        "tf32": 4.0,
+        "int64": 8.0,
+        "long": 8.0,
+        "float64": 8.0,
+        "double": 8.0,
+        "nvfp4": 0.5,
+    }
+    return float(dtype_map.get(key, default_bytes))
+
+
 class EinsumGraphAnalyzer:
     """Analyze `einsum_graph.yaml` and write `analysis.yaml`."""
 
@@ -201,6 +239,24 @@ class EinsumGraphAnalyzer:
         # AND consumed by another op.
         all_layer_ids: Set[str] = set(layers_in.keys())
 
+        _ZERO_COPY_VIEW_OPS = {
+            "expand", "expand_as",
+            "view", "reshape", "contiguous",
+            "transpose", "permute", "t",
+            "unsqueeze", "squeeze", "flatten",
+            "unfold", "unflatten",
+            # chunk/split return views into the source tensor
+            "chunk", "split", "tensor_split",
+        }
+        _SLICE_VIEW_OPS = {
+            "__getitem__", "narrow", "slice", "select",
+        }
+        _SCATTER_OPS = {
+            "__setitem__", "scatter", "scatter_",
+            "index_copy", "index_copy_",
+            "index_put", "index_put_",
+        }
+
         tensor_producers: Dict[str, str] = {}   # tensor_name -> producer_layer_id
         tensor_consumers: Dict[str, Set[str]] = {}  # tensor_name -> set of consumer_layer_ids
 
@@ -216,6 +272,31 @@ class EinsumGraphAnalyzer:
             for iname in (t_names.get("inputs") or []):
                 if iname in tensor_producers:
                     tensor_consumers.setdefault(iname, set()).add(layer_id)
+
+        # Build alias map for zero-copy/slice view chains so tensor origin
+        # (external start input vs graph-internal) can be resolved robustly.
+        tensor_alias_parent: Dict[str, str] = {}
+        for _, layer in layers_in.items():
+            op_type = str(layer.get("type", "")).lower()
+            if op_type not in (_ZERO_COPY_VIEW_OPS | _SLICE_VIEW_OPS):
+                continue
+            t_names = layer.get("tensor_names") or {}
+            input_names = list(t_names.get("inputs") or [])
+            output_names = list(t_names.get("outputs") or [])
+            if not input_names or not output_names:
+                continue
+            source_name = input_names[0]
+            for out_name in output_names:
+                if out_name:
+                    tensor_alias_parent[out_name] = source_name
+
+        def _resolve_tensor_origin_name(tensor_name: str) -> str:
+            current = tensor_name
+            seen: Set[str] = set()
+            while current in tensor_alias_parent and current not in seen:
+                seen.add(current)
+                current = tensor_alias_parent[current]
+            return current
         
         # Identify intermediate tensors: produced by one op AND consumed by another
         intermediate_tensors: Set[str] = set()
@@ -262,6 +343,8 @@ class EinsumGraphAnalyzer:
         total_other_ops = 0     # CUDA-core elementwise/reduction ops
         total_unfused_elems = 0       # Σ (all input + output elems) per op
         total_intermediate_elems = 0  # Σ intermediate activation elems
+        total_unfused_bytes = 0.0
+        total_intermediate_bytes = 0.0
 
         # Deduplicated external (non-intermediate) tensor tracking for the
         # fused / fused_prefetched model.  When the same external tensor
@@ -269,6 +352,8 @@ class EinsumGraphAnalyzer:
         # DRAM once.  We track by tensor_name → max element count.
         unique_external_inputs: Dict[str, int] = {}
         unique_external_outputs: Dict[str, int] = {}
+        unique_external_input_bytes: Dict[str, float] = {}
+        unique_external_output_bytes: Dict[str, float] = {}
 
         for layer_id, layer in layers_in.items():
             op_type = str(layer.get("type", "unknown"))
@@ -363,6 +448,9 @@ class EinsumGraphAnalyzer:
             output_shapes = tensor_shapes.get("outputs") or []
             input_type_list = tensor_types.get("inputs") or []
             output_type_list = tensor_types.get("outputs") or []
+            tensor_dtypes: Dict[str, Any] = layer.get("tensor_dtypes") or {}
+            input_dtype_list = tensor_dtypes.get("inputs") or []
+            output_dtype_list = tensor_dtypes.get("outputs") or []
 
             # ── Step 1: Compute per-tensor sizes from shapes ──
             input_sizes: List[int] = []
@@ -379,24 +467,6 @@ class EinsumGraphAnalyzer:
             memory_writes: List[int] = list(output_sizes)
 
             # ── Step 2: Override memory_reads/writes for special-case ops ──
-
-            _ZERO_COPY_VIEW_OPS = {
-                "expand", "expand_as",
-                "view", "reshape", "contiguous",
-                "transpose", "permute", "t",
-                "unsqueeze", "squeeze", "flatten",
-                "unfold", "unflatten",
-                # chunk/split return views into the source tensor
-                "chunk", "split", "tensor_split",
-            }
-            _SLICE_VIEW_OPS = {
-                "__getitem__", "narrow", "slice", "select",
-            }
-            _SCATTER_OPS = {
-                "__setitem__", "scatter", "scatter_",
-                "index_copy", "index_copy_",
-                "index_put", "index_put_",
-            }
 
             # For embedding (table lookup), only the gathered rows are read
             # from the weight matrix, not the entire vocabulary table.
@@ -468,6 +538,22 @@ class EinsumGraphAnalyzer:
             output_elems = int(sum(memory_writes))
             unfused_elems = input_elems + output_elems
 
+            input_read_bytes_list: List[float] = []
+            for i, mem_read in enumerate(memory_reads):
+                dtype = input_dtype_list[i] if i < len(input_dtype_list) else None
+                bpe = _dtype_bytes(dtype, element_size)
+                input_read_bytes_list.append(float(mem_read) * bpe)
+
+            output_write_bytes_list: List[float] = []
+            for i, mem_write in enumerate(memory_writes):
+                dtype = output_dtype_list[i] if i < len(output_dtype_list) else None
+                bpe = _dtype_bytes(dtype, element_size)
+                output_write_bytes_list.append(float(mem_write) * bpe)
+
+            input_bytes = float(sum(input_read_bytes_list))
+            output_bytes = float(sum(output_write_bytes_list))
+            unfused_bytes = input_bytes + output_bytes
+
             # ── Step 4: Classify inputs as external vs graph-internal ──
             # Uses memory_reads (already corrected) so no re-scanning needed.
             # Classify each input tensor:
@@ -480,21 +566,35 @@ class EinsumGraphAnalyzer:
             input_name_list = tensor_names.get("inputs") or []
             graph_internal_input_elems = 0   # intermediate activations from other ops
             external_input_elems = 0         # weights + model-level inputs (always DRAM)
+            graph_internal_input_bytes = 0.0
+            external_input_bytes = 0.0
+            weight_input_elems = 0
+            weight_input_bytes = 0.0
 
             for i, mem_read in enumerate(memory_reads):
                 if mem_read <= 0:
                     continue
                 itype = input_type_list[i] if i < len(input_type_list) else "weight"
                 iname = input_name_list[i] if i < len(input_name_list) else ""
-                is_graph_internal = (itype != "weight" and iname in tensor_producers)
+                canonical_iname = _resolve_tensor_origin_name(iname) if iname else ""
+                is_graph_internal = (itype != "weight" and canonical_iname in tensor_producers)
+                read_bytes = input_read_bytes_list[i] if i < len(input_read_bytes_list) else 0.0
 
                 if is_graph_internal:
                     graph_internal_input_elems += mem_read
+                    graph_internal_input_bytes += read_bytes
                 else:
                     external_input_elems += mem_read
-                    if iname:
-                        unique_external_inputs[iname] = max(
-                            unique_external_inputs.get(iname, 0), mem_read
+                    external_input_bytes += read_bytes
+                    if itype == "weight":
+                        weight_input_elems += int(mem_read)
+                        weight_input_bytes += float(read_bytes)
+                    if canonical_iname:
+                        unique_external_inputs[canonical_iname] = max(
+                            unique_external_inputs.get(canonical_iname, 0), mem_read
+                        )
+                        unique_external_input_bytes[canonical_iname] = max(
+                            unique_external_input_bytes.get(canonical_iname, 0.0), float(read_bytes)
                         )
 
             intermediate_input_elems = int(graph_internal_input_elems)
@@ -509,19 +609,26 @@ class EinsumGraphAnalyzer:
 
             # Intermediate output elems: written to cache (fused) not DRAM
             intermediate_output_elems = output_elems if output_is_intermediate else 0
+            intermediate_output_bytes = output_bytes if output_is_intermediate else 0.0
             # Total intermediate elems for this layer (inputs + outputs)
             layer_intermediate_elems = intermediate_input_elems + intermediate_output_elems
+            layer_intermediate_bytes = graph_internal_input_bytes + intermediate_output_bytes
 
             # Model output elems: final graph outputs that must go to DRAM
             model_output_elems = output_elems if not output_is_intermediate else 0
+            model_output_bytes = output_bytes if not output_is_intermediate else 0.0
             # Per-op model I/O: external inputs + model outputs (no intermediates)
             model_io_elems = model_input_elems + model_output_elems
+            model_io_bytes = external_input_bytes + model_output_bytes
 
             # Track unique external outputs for deduplication.
             if not output_is_intermediate:
                 for oname in output_name_list:
                     unique_external_outputs[oname] = max(
                         unique_external_outputs.get(oname, 0), int(output_elems)
+                    )
+                    unique_external_output_bytes[oname] = max(
+                        unique_external_output_bytes.get(oname, 0.0), float(output_bytes)
                     )
 
             # Per-op fused elements: only non-intermediate DRAM traffic
@@ -535,8 +642,10 @@ class EinsumGraphAnalyzer:
                 "other_ops": other_ops,
                 "flops": flops,
                 "unfused_elements": unfused_elems,
+                "unfused_bytes": int(round(unfused_bytes)),
                 "orojenesis_elements": None,
                 "fused_elements": fused_elems,
+                "fused_bytes": int(round(model_io_bytes)),
                 "tensor_shapes": {
                     "inputs": [s for s in input_shapes if isinstance(s, list)],
                     "outputs": [s for s in output_shapes if isinstance(s, list)],
@@ -554,9 +663,15 @@ class EinsumGraphAnalyzer:
                     "outputs": list(output_type_list),
                 },
                 "input_elements": input_elems,
+                "input_bytes": int(round(input_bytes)),
                 "output_elements": output_elems,
+                "output_bytes": int(round(output_bytes)),
                 "intermediate_elements": layer_intermediate_elems,
+                "intermediate_bytes": int(round(layer_intermediate_bytes)),
                 "model_io_elements": model_io_elems,
+                "model_io_bytes": int(round(model_io_bytes)),
+                "weight_elements": int(weight_input_elems),
+                "weight_bytes": int(round(weight_input_bytes)),
                 "input_is_intermediate": input_is_intermediate,
                 "output_is_intermediate": output_is_intermediate,
                 "connections": {"inputs": input_layer_ids, "outputs": output_layer_ids},
@@ -567,6 +682,8 @@ class EinsumGraphAnalyzer:
             total_flops += flops
             total_unfused_elems += unfused_elems
             total_intermediate_elems += layer_intermediate_elems
+            total_unfused_bytes += unfused_bytes
+            total_intermediate_bytes += layer_intermediate_bytes
 
         # Deduplicated graph-level external I/O: when the same tensor
         # (e.g. model input x) fans out to multiple ops, count it once.
@@ -575,8 +692,13 @@ class EinsumGraphAnalyzer:
             sum(unique_external_inputs.values())
             + sum(unique_external_outputs.values())
         )
+        total_fused_prefetched_bytes = float(
+            sum(unique_external_input_bytes.values())
+            + sum(unique_external_output_bytes.values())
+        )
         # fused_elements == fused_prefetched_elements (same dedup logic)
         total_fused_elems = total_fused_prefetched_elems
+        total_fused_bytes = total_fused_prefetched_bytes
 
         # model_io_elements: raw per-op sum (may double-count shared inputs).
         # Kept for diagnostic / per-layer inspection.
@@ -584,6 +706,18 @@ class EinsumGraphAnalyzer:
             layer.get("model_io_elements", 0)
             for layer in layers_out.values()
         )
+        total_model_io_bytes = float(sum(
+            layer.get("model_io_bytes", 0)
+            for layer in layers_out.values()
+        ))
+        total_weight_elems = int(sum(
+            layer.get("weight_elements", 0)
+            for layer in layers_out.values()
+        ))
+        total_weight_bytes = float(sum(
+            layer.get("weight_bytes", 0)
+            for layer in layers_out.values()
+        ))
 
         analysis: Dict[str, Any] = {
             "layers": layers_out,
@@ -594,11 +728,18 @@ class EinsumGraphAnalyzer:
                 "other_ops": int(total_other_ops),
                 "flops": int(total_flops),
                 "unfused_elements": int(total_unfused_elems),
+                "unfused_bytes": int(round(total_unfused_bytes)),
                 "orojenesis_elements": None,
                 "fused_elements": int(total_fused_elems),
+                "fused_bytes": int(round(total_fused_bytes)),
                 "fused_prefetched_elements": total_fused_prefetched_elems,
+                "fused_prefetched_bytes": int(round(total_fused_prefetched_bytes)),
                 "model_io_elements": int(total_model_io_elems),
+                "model_io_bytes": int(round(total_model_io_bytes)),
                 "intermediate_elements": int(total_intermediate_elems),
+                "intermediate_bytes": int(round(total_intermediate_bytes)),
+                "weight_elements": int(total_weight_elems),
+                "weight_bytes": int(round(total_weight_bytes)),
                 "num_intermediate_tensors": len(intermediate_tensors),
             },
             "metadata": {

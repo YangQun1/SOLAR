@@ -56,7 +56,7 @@ index 53b3a37..856b21c 100644
  
      def check_node(self, node: COMPUTATION_NODES) -> None:
 diff --git a/src/torchview/recorder_tensor.py b/src/torchview/recorder_tensor.py
-index c0e2aee..f6ecf1a 100644
+index c0e2aee..6cf8c23 100644
 --- a/src/torchview/recorder_tensor.py
 +++ b/src/torchview/recorder_tensor.py
 @@ -236,7 +236,8 @@ class RecorderTensor(torch.Tensor):
@@ -103,7 +103,7 @@ index c0e2aee..f6ecf1a 100644
 +        _seen_param_ids: set[int] = set()
 +
 +        for arg in _flatten_args(args):
-+            if not isinstance(arg, torch.Tensor) or not hasattr(arg, 'shape') or len(arg.shape) == 0:
++            if not isinstance(arg, torch.Tensor) or not hasattr(arg, 'shape'):
 +                continue
 +
 +            # Determine if this tensor is a model parameter or an activation.

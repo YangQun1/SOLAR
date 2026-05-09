@@ -133,8 +133,8 @@ class EinsumGraphPerfModel:
         total_macs = float(total.get("macs", 0))
         total_flops = float(total.get("flops", 0))
         
-        # Parse elements from new format, with fallback to old bytes format
-        # New format uses unfused_elements, old format uses orojenesis_elements or _bytes suffix
+        # Parse elements from new format and prefer explicit byte totals when available.
+        # Fallback to elements * bytes_per_element for backward compatibility.
         unfused_val = total.get("unfused_elements") or total.get("orojenesis_elements")
         if unfused_val is not None:
             # New format: elements
@@ -146,14 +146,38 @@ class EinsumGraphPerfModel:
             total_weight_elems = float(total.get("weight_elements", 0))
             total_model_io_elems = float(total.get("model_io_elements", 0))
             total_intermediate_elems = float(total.get("intermediate_elements", 0))
-            
-            # Convert elements to bytes
-            total_orojenesis_bytes = total_orojenesis_elems * bytes_per_element
-            total_fused_bytes = total_fused_elems * bytes_per_element
-            total_fused_prefetched_bytes = total_fused_prefetched_elems * bytes_per_element
-            total_weight_bytes = total_weight_elems * bytes_per_element
-            total_model_io_bytes = total_model_io_elems * bytes_per_element
-            total_intermediate_bytes = total_intermediate_elems * bytes_per_element
+
+            # Prefer explicit bytes from analysis when present (mixed dtypes);
+            # otherwise fall back to global bytes_per_element conversion.
+            if total.get("unfused_bytes") is not None:
+                total_orojenesis_bytes = float(total.get("unfused_bytes", 0))
+            else:
+                total_orojenesis_bytes = total_orojenesis_elems * bytes_per_element
+
+            if total.get("fused_bytes") is not None:
+                total_fused_bytes = float(total.get("fused_bytes", 0))
+            else:
+                total_fused_bytes = total_fused_elems * bytes_per_element
+
+            if total.get("fused_prefetched_bytes") is not None:
+                total_fused_prefetched_bytes = float(total.get("fused_prefetched_bytes", 0))
+            else:
+                total_fused_prefetched_bytes = total_fused_prefetched_elems * bytes_per_element
+
+            if total.get("weight_bytes") is not None:
+                total_weight_bytes = float(total.get("weight_bytes", 0))
+            else:
+                total_weight_bytes = total_weight_elems * bytes_per_element
+
+            if total.get("model_io_bytes") is not None:
+                total_model_io_bytes = float(total.get("model_io_bytes", 0))
+            else:
+                total_model_io_bytes = total_model_io_elems * bytes_per_element
+
+            if total.get("intermediate_bytes") is not None:
+                total_intermediate_bytes = float(total.get("intermediate_bytes", 0))
+            else:
+                total_intermediate_bytes = total_intermediate_elems * bytes_per_element
         else:
             # Old format: bytes (backward compatibility)
             total_orojenesis_bytes = float(total.get("orojenesis_bytes", 0))

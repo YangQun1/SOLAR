@@ -31,6 +31,7 @@ from solar.common.types import ProcessingConfig
 from solar.graph import PyTorchProcessor
 from solar.einsum.pytorch_to_einsum import PyTorchToEinsum
 from solar.analysis.graph_analyzer import EinsumGraphAnalyzer
+from solar.perf import EinsumGraphPerfModel
 
 
 def _run_full_pipeline(tmp_path: Path, model_source: str, precision: str = "fp32") -> dict:
@@ -1051,3 +1052,230 @@ class TestKernel88MinGPTIntermediateTagging:
         """fused_prefetched (deduplicated) must be <= fused (per-op sum)."""
         total = analysis["total"]
         assert total["fused_prefetched_elements"] <= total["fused_elements"]
+
+
+# ---------------------------------------------------------------------------
+# Regression: external input through view op must remain external in fused/model_io
+# ---------------------------------------------------------------------------
+class TestExternalInputThroughViewAccounting:
+    """If an external input flows through a zero-copy view (e.g. squeeze)
+    before compute, fused/model_io must still include that external read.
+
+    This catches undercounting bugs where view-produced tensors are treated as
+    graph-internal intermediates and the original external input read is dropped.
+    """
+
+    MODEL_SOURCE = """\
+    import torch
+    import torch.nn as nn
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(8, 4))
+
+        def forward(self, x):
+            y = x.squeeze(1)          # zero-copy view of external input
+            return torch.matmul(y, self.weight)
+
+    def get_inputs():
+        return [torch.randn(2, 1, 8)]
+
+    def get_init_inputs():
+        return []
+    """
+
+    @pytest.fixture
+    def analysis(self, tmp_path):
+        return _run_full_pipeline(tmp_path, self.MODEL_SOURCE)
+
+    def test_total_fused_includes_external_view_input(self, analysis):
+        # x: [2,1,8] -> 16 elems (external input)
+        # weight: [8,4] -> 32 elems (external weight)
+        # output: [2,4] -> 8 elems (external output)
+        expected_min = 16 + 32 + 8
+        assert analysis["total"]["fused_elements"] >= expected_min, (
+            f"Expected fused_elements to include external input through squeeze: >= {expected_min}, "
+            f"got {analysis['total']['fused_elements']}"
+        )
+
+    def test_total_model_io_includes_external_view_input(self, analysis):
+        expected_min = 16 + 32 + 8
+        assert analysis["total"]["model_io_elements"] >= expected_min, (
+            f"Expected model_io_elements to include external input through squeeze: >= {expected_min}, "
+            f"got {analysis['total']['model_io_elements']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression: mixed dtype bytes should not use one global bytes_per_element
+# ---------------------------------------------------------------------------
+class TestMixedDtypeBytesAccounting:
+    """Mixed dtype model I/O should be charged by per-tensor dtype sizes.
+
+    Current perf path multiplies element counts by one global bytes_per_element,
+    which undercounts int32/int64 inputs in fp16/bf16 runs.
+    """
+
+    MODEL_SOURCE = """\
+    import torch
+    import torch.nn as nn
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, x, idx):
+            # x: fp16, idx: int32
+            # mixed dtype path: idx is materialized and cast before add
+            return x + idx.to(torch.float16)
+
+    def get_inputs():
+        x = torch.randn(4, 8, dtype=torch.float16)
+        idx = torch.randint(-8, 8, (4, 8), dtype=torch.int32)
+        return [x, idx]
+
+    def get_init_inputs():
+        return []
+    """
+
+    def _analyze_and_predict(self, tmp_path):
+        analysis = _run_full_pipeline(tmp_path, self.MODEL_SOURCE, precision="fp16")
+        analysis_path = tmp_path / "analysis" / "analysis.yaml"
+        perf_dir = tmp_path / "perf"
+        perf_dir.mkdir(exist_ok=True)
+        perf = EinsumGraphPerfModel().predict(
+            str(analysis_path), str(perf_dir), arch_config="B200", precision="fp16"
+        )
+        assert perf is not None
+        return analysis, perf
+
+    def test_mixed_dtype_memory_bytes_uses_real_tensor_dtypes(self, tmp_path):
+        _analysis, perf = self._analyze_and_predict(tmp_path)
+
+        # True model I/O bytes for this model:
+        # x(fp16): 4*8*2 = 64
+        # idx(int32): 4*8*4 = 128
+        # output(fp16): 4*8*2 = 64
+        expected_model_io_bytes = 64 + 128 + 64
+
+        # Regression target: perf should account mixed dtype bytes, not treat all
+        # elements as fp16 bytes.
+        assert perf["memory_breakdown"]["model_io_bytes"] >= expected_model_io_bytes, (
+            f"Expected mixed dtype model_io_bytes >= {expected_model_io_bytes}, "
+            f"got {perf['memory_breakdown']['model_io_bytes']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression: sparse gather reads should count touched external data
+# ---------------------------------------------------------------------------
+class TestSparseGatherExternalAccounting:
+    """Large external cache with sparse index access should charge touched data.
+
+    This case intentionally avoids any view op so sparse gather read accounting
+    is validated independently.
+    """
+
+    MODEL_SOURCE = """\
+    import torch
+    import torch.nn as nn
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, k_cache, v_cache, kv_indices):
+            # k_cache/v_cache: large external buffers
+            # sparse gather by indices (no view ops)
+            k_sel = k_cache[kv_indices]
+            v_sel = v_cache[kv_indices]
+            return k_sel + v_sel
+
+    def get_inputs():
+        torch.manual_seed(0)
+        k_cache = torch.randn(1024, 4, 8)
+        v_cache = torch.randn(1024, 4, 8)
+        kv_indices = torch.tensor([0, 1, 7, 8, 9, 11, 128, 255], dtype=torch.long)
+        return [k_cache, v_cache, kv_indices]
+
+    def get_init_inputs():
+        return []
+    """
+
+    @pytest.fixture
+    def analysis(self, tmp_path):
+        return _run_full_pipeline(tmp_path, self.MODEL_SOURCE)
+
+    def test_sparse_external_reads_not_dropped(self, analysis):
+        # touched elems per cache tensor = 8 indices * 4 * 8 = 256
+        # two caches => 512, plus output (256)
+        expected_fused = 256 + 256 + 256
+        full_target = (
+            1024 * 4 * 8 * 2 + # k_cache + v_cache
+            8 + # indices
+            256 # output
+            )
+        assert analysis["total"]["fused_elements"] == expected_fused, (
+            f"Expected fused_elements == {expected_fused} for sparse touched cache, "
+            f"got {analysis['total']['fused_elements']}"
+        )
+        assert analysis["total"]["fused_elements"] < full_target, (
+            f"Expected fused_elements < full target ({full_target}) for sparse access, "
+            f"got {analysis['total']['fused_elements']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression: sparse scatter output should charge written slice, not full target
+# ---------------------------------------------------------------------------
+class TestSparseScatterOutputAccounting:
+    """Sparse scatter/index write should account output by written slice size."""
+
+    MODEL_SOURCE = """\
+    import torch
+    import torch.nn as nn
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, target, kv_indices, src):
+            # sparse write into a large output tensor
+            target.index_copy_(0, kv_indices, src)
+            return target
+
+    def get_inputs():
+        torch.manual_seed(0)
+        target = torch.randn(1024, 4, 8)
+        kv_indices = torch.tensor([0, 1, 7, 8, 9, 11, 128, 255], dtype=torch.long)
+        src = torch.randn(8, 4, 8)
+        return [target, kv_indices, src]
+
+    def get_init_inputs():
+        return []
+    """
+
+    @pytest.fixture
+    def analysis(self, tmp_path):
+        return _run_full_pipeline(tmp_path, self.MODEL_SOURCE)
+
+    def test_sparse_scatter_output_is_slice_sized(self, analysis):
+        full_target = 1024 * 4 * 8
+        written_slice = 8 * 4 * 8
+
+        found = False
+        for lid, layer in analysis["layers"].items():
+            if layer["type"] in ("index_copy", "index_copy_",
+                                 "__setitem__", "scatter", "scatter_"):
+                found = True
+                assert layer["output_elements"] == written_slice, (
+                    f"{lid}: output_elements should equal written slice {written_slice}, "
+                    f"got {layer['output_elements']}"
+                )
+                assert layer["output_elements"] < full_target, (
+                    f"{lid}: output_elements should be sparse (< {full_target}), "
+                    f"got {layer['output_elements']}"
+                )
+
+        assert found, "No scatter/index write op found in graph"

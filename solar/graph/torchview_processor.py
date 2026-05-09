@@ -487,6 +487,55 @@ class TorchviewProcessor:
                         dtype = get_dtype(out)
                         if dtype:
                             output_dtypes.append(dtype)
+
+        # FunctionNode raw attributes often carry the true runtime tensor dtype
+        # (e.g. torch.bfloat16) even when torchview metadata falls back to
+        # fake/default float32. Prefer parsed raw-attribute dtypes for inputs.
+        if node_class == 'FunctionNode' and hasattr(node, 'attributes') and node.attributes:
+            import re
+
+            attr_dtypes = [
+                m.group(1)
+                for m in re.finditer(r"dtype=([A-Za-z0-9_\.]+)", str(node.attributes))
+            ]
+            if attr_dtypes:
+                if input_shapes:
+                    input_dtypes = list(attr_dtypes[: len(input_shapes)])
+                else:
+                    input_dtypes = list(attr_dtypes)
+
+                # For dtype-preserving ops, infer output dtype from the first
+                # input dtype when torchview reports float32 or omits it.
+                # This covers view/index ops as well as pointwise arithmetic
+                # ops that preserve their input dtype.
+                preserving_ops = {
+                    # View / index / memory ops
+                    "__getitem__", "squeeze", "unsqueeze", "view", "reshape",
+                    "transpose", "permute", "contiguous", "flatten", "narrow",
+                    "select", "slice", "split", "chunk", "tensor_split", "cat",
+                    "concat", "stack", "repeat", "repeat_interleave", "tile",
+                    "roll", "flip", "clone",
+                    # Pointwise arithmetic / math ops (preserve input dtype)
+                    "add", "sub", "mul", "div", "truediv", "floordiv", "mod",
+                    "fmod", "remainder", "pow", "neg", "abs", "reciprocal",
+                    "sqrt", "rsqrt", "exp", "exp2", "log", "log2", "log10",
+                    "sin", "cos", "tan", "tanh", "sigmoid",
+                    "floor", "ceil", "round", "trunc", "frac",
+                    "clamp", "clip", "min", "max", "minimum", "maximum",
+                    "sum", "mean", "prod", "logsumexp",
+                    "relu", "gelu", "silu", "elu", "leaky_relu",
+                    "softmax", "log_softmax",
+                }
+                op_name = (node_type or "").lower()
+                if op_name in preserving_ops:
+                    only_fp32_outputs = (
+                        not output_dtypes
+                        or all(str(d).strip().lower() in {"torch.float32", "float32"} for d in output_dtypes)
+                    )
+                    if only_fp32_outputs and input_dtypes:
+                        out_len = len(output_shapes or [])
+                        if out_len > 0:
+                            output_dtypes = [input_dtypes[0]] * out_len
         
         # Fallback: try input_shape/output_shape attributes (some nodes might have these)
         if not input_dtypes and hasattr(node, 'input_dtype') and node.input_dtype:
@@ -501,29 +550,27 @@ class TorchviewProcessor:
             else:
                 output_dtypes = [str(node.output_dtype)]
         
-        # Fallback: If we have shapes but no dtypes, try to infer from original model
-        # This ensures dtype counts match shape counts
+        # Fallback: If shape count exceeds dtype count, only pad when we have
+        # at least one concrete dtype from torchview.
+        #
+        # Do NOT force missing dtypes to a global default (e.g. float32),
+        # because that can systematically overestimate memory bytes for models
+        # that run in bf16/fp16 while torchview omits dtype metadata on
+        # intermediate function nodes.
         if input_shapes is None:
             input_shapes = []
         if output_shapes is None:
             output_shapes = []
-        
-        if original_model is not None:
-            if self._cached_default_dtype is None:
-                for param in original_model.parameters():
-                    if param.dtype is not None:
-                        self._cached_default_dtype = str(param.dtype)
-                        break
-                if self._cached_default_dtype is None:
-                    self._cached_default_dtype = "torch.float32"
 
-            default_dtype = self._cached_default_dtype
-
+        if input_dtypes and len(input_dtypes) < len(input_shapes):
+            fill_dtype = input_dtypes[-1]
             while len(input_dtypes) < len(input_shapes):
-                input_dtypes.append(default_dtype)
+                input_dtypes.append(fill_dtype)
 
+        if output_dtypes and len(output_dtypes) < len(output_shapes):
+            fill_dtype = output_dtypes[-1]
             while len(output_dtypes) < len(output_shapes):
-                output_dtypes.append(default_dtype)
+                output_dtypes.append(fill_dtype)
         
         return input_dtypes, output_dtypes
     
